@@ -1,0 +1,24 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = "Default template for PDM package"
+authors = [
+    {name = "Harrrryz", email = "harry.wadu233@gmail.com"},
+]
+dependencies = ["fastapi[standard]>=0.115.8", "ormar>=0.20.2", "pandas>=2.2.3", "openpyxl>=3.1.5", "aiosqlite>=0.21.0"]
+requires-python = "==3.12.*"
+readme = "README.md"
+license = {text = "MIT"}
+
+
+[tool.pdm]
+distribution = false
+[tool.pdm.scripts]
+start = "fastapi dev ./src/backend/main.py --host 0.0.0.0 --port 8002"
+serve = 'fastapi run ./src/backend/main.py --host 0.0.0.0 --port 8002'
+
+[dependency-groups]
+dev = [
+    "notebook>=7.3.2",
+    "ipykernel>=6.29.5",
+]
