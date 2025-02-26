@@ -1,19 +1,27 @@
-from typing import Dict, Any
+from typing import Annotated, Dict, Any, Union
 from contextlib import asynccontextmanager
 import sqlite3
+import jwt
+from jwt.exceptions import InvalidTokenError
 import ormar
 import databases
 import sqlalchemy
 from enum import Enum
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Sequence, TypeVar, Generic
 from fastapi import FastAPI, HTTPException, Depends, Query, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 import pandas as pd
-
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi import Depends, FastAPI, HTTPException, status
+from passlib.context import CryptContext
 from backend.utils import add_Batch_Size_impact_column, add_Consumption_class_column, add_Consumption_value_column, add_Coverage_class_column, add_Pending_Order_value_column, add_Safety_Stock_impact_column, add_benefit_column, add_days_column, add_days_objective_column, add_stock_class_column, add_stock_value_column
 
+# Constants
+SECRET_KEY = "09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 DB_NAME = "src/backend/data/SchneiderDatabase.db"
 sqlite_url = f"sqlite:///{DB_NAME}"
@@ -28,6 +36,22 @@ T = TypeVar('T')
 
 
 # ORM Models
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
+class TokenData(BaseModel):
+    username: Union[str, None] = None
+
+
+class UserModel(ormar.Model):
+    ormar_config = base_ormar_config.copy(tablename="users")
+    id: int = ormar.Integer(primary_key=True)  # type: ignore
+    userName: str = ormar.String(max_length=255,)  # type: ignore
+    password: str = ormar.String(max_length=255)  # type: ignore
+
+
 class InventoryModel(ormar.Model):
     ormar_config = base_ormar_config.copy(tablename="my_table")
 
@@ -78,13 +102,15 @@ class InventoryModel(ormar.Model):
     Days_Objective: float = ormar.Float(
         nullable=True, name="Days Objective")  # type: ignore
     Benefit: float = ormar.Float(nullable=True)  # type: ignore
+    user: UserModel = ormar.ForeignKey(
+        UserModel, related_name='inventory_list')
 
     # Add more fields as needed
 
 # Pydantic Models for API
 
 
-class InventoryItem(BaseModel):  # For API responses.
+class InventoryItemDto(BaseModel):  # For API responses.
     Part_Number: str
     Description: Optional[str]
     Part_sub_commodity: Optional[str]
@@ -114,18 +140,25 @@ class InventoryItem(BaseModel):  # For API responses.
     # Add all fields here
 
 
-class ProcurementBarChartModel(BaseModel):
+class ProcurementBarChartModelDto(BaseModel):
+    user_id: int
     Order_specific_sum: float
     kanban_sum: float
     MRP_sum: float
 
 
-class CoverageClassBarChartModel(BaseModel):
+class CoverageClassBarChartModelDto(BaseModel):
+    user_id: int
     Order_specific_sum: float
     fifteen_Days_sum: float
     thirty_Days_sum: float
     ninety_Days_sum: float
     ninety_plus_Days_sum: float
+
+
+class UserDto(BaseModel):
+    userName: str
+    password: str
 
 
 class PaginateModel(BaseModel, Generic[T]):
@@ -145,11 +178,118 @@ async def pagniate_inventory(page: int, per_page: int) -> PaginateModel[Inventor
         items=inventory
     )
 
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 # Utility Functions
 
 
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+
+def fake_decode_token(token):
+    return UserModel(
+        username=token + "fakedecoded", email="john@example.com", full_name="John Doe"
+    )
+
+
+async def authenticate_user(username: str, password: str):
+    user = await UserModel.objects.get_or_none(userName=username)
+    if not user:
+        return False
+    if not verify_password(password, user.password):
+        return False
+    return user
+
+
+async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        print("payload sub: " + username)
+        if username is None:
+            raise credentials_exception
+        token_data = TokenData(username=username)
+    except InvalidTokenError:
+        raise credentials_exception
+    user = await UserModel.objects.get_or_none(userName=token_data.username)
+    if user is None:
+        raise credentials_exception
+    return user
+
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
 async def init_db_and_tables():
+    base_ormar_config.metadata.drop_all(engine)
     base_ormar_config.metadata.create_all(engine)
+    init_users = ['Harry', 'Leo']
+    for user_name in init_users:
+        pwd = get_password_hash('12345678')
+        existing_user = await UserModel.objects.get_or_none(userName=user_name)
+        if existing_user:
+            raise HTTPException(status_code=400, detail="User already exists!")
+        user = UserModel(userName=user_name, password=pwd)
+        await user.save()
+
+    excel_file = "src/backend/data/data.xlsx"
+    table_name = "my_table"
+
+    try:
+        df = pd.read_excel(excel_file)
+
+    except FileNotFoundError:
+        print(f"Error: Excel file '{excel_file}' not found.")
+        exit()
+
+    conn = sqlite3.connect(DB_NAME)
+
+    df.to_sql(table_name, conn, if_exists="replace", index=False)
+    conn.close()
+
+    # print very object in Usermodel
+    add_stock_value_column(DB_NAME, table_name)
+    add_days_column(DB_NAME, table_name)
+    add_Safety_Stock_impact_column(DB_NAME, table_name)
+    add_Batch_Size_impact_column(DB_NAME, table_name)
+    add_Pending_Order_value_column(DB_NAME, table_name)
+    add_Consumption_value_column(DB_NAME, table_name)
+    add_Coverage_class_column(DB_NAME, table_name)
+    add_Consumption_class_column(DB_NAME, table_name)
+    add_stock_class_column(DB_NAME, table_name)
+    add_days_objective_column(DB_NAME, table_name)
+    add_benefit_column(DB_NAME, table_name)
+    # for each row in my_table, create a user attribute
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    cursor.execute(f"ALTER TABLE `{table_name}` ADD COLUMN `user` INTEGER")
+    update_query = f"""
+        UPDATE `{table_name}`
+        SET `user` = 1
+    """
+    cursor.execute(update_query)
+    conn.commit()
+    conn.close()
 
 
 @asynccontextmanager
@@ -168,16 +308,42 @@ app.add_middleware(
 )
 
 
-@app.get("/get_inventory/", response_model=PaginateModel[InventoryItem])
+@app.post('/token')
+async def login(form_data: Annotated[OAuth2PasswordRequestForm, Depends()]) -> Token:
+    # Replace with your actual user validation logic
+    user = await authenticate_user(form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(status_code=400, detail="User does not exist!")
+
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.userName}, expires_delta=access_token_expires
+    )
+    return Token(access_token=access_token, token_type="bearer")
+
+
+@app.post("/create_user/", tags=['user'], response_model=UserModel)
+async def create_user(userDto: UserDto) -> UserModel:
+    existing_user = await UserModel.objects.get_or_none(userName=userDto.userName)
+    if existing_user:
+        raise HTTPException(status_code=400, detail="User already exists!")
+    pwd = get_password_hash(userDto.password)
+    user = UserModel(userName=userDto.userName, password=pwd)
+    await user.save()
+    return user
+
+
+@app.get("/get_inventory/", response_model=PaginateModel[InventoryItemDto],)
 async def read_inventory(
     page: int,
     per_page: int,
     Part_sub_commodity: str = "",
     Product: str = "",
     location: str = "",
+    user: UserModel = Depends(get_current_user),
 ) -> PaginateModel[InventoryModel]:
     try:
-        query = InventoryModel.objects
+        query = InventoryModel.objects.filter(user=user.id)
         if Part_sub_commodity:
             query = query.filter(Part_sub_commodity=Part_sub_commodity)
         if Product:
@@ -197,25 +363,28 @@ async def read_inventory(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/Provutement_mode_bar_chart_data", response_model=ProcurementBarChartModel)
-async def get_procurement_mode_summary() -> ProcurementBarChartModel:
+@app.get("/Provutement_mode_bar_chart_data", response_model=ProcurementBarChartModelDto)
+async def get_procurement_mode_summary(user: UserModel = Depends(get_current_user)) -> ProcurementBarChartModelDto:
     Order_specific_part_query = f"""
         SELECT SUM("Stock Value") AS Total_Stock_Value
     FROM my_table
     WHERE "Procurement mode" = 'Order specific'
-    AND "Stock Value" IS NOT NULL;
+    AND "Stock Value" IS NOT NULL
+    AND user = {user.id};
     """
     kanban_query = f"""
         SELECT SUM("Stock Value") AS Total_Stock_Value
     FROM my_table
     WHERE "Procurement mode" = 'kanban'
-    AND "Stock Value" IS NOT NULL;
+    AND "Stock Value" IS NOT NULL
+    AND user = {user.id};
     """
     MRP_query = f"""
     SELECT SUM("Stock Value") AS Total_Stock_Value
     FROM my_table
     WHERE "Procurement mode" = 'MRP'
-    AND "Stock Value" IS NOT NULL;
+    AND "Stock Value" IS NOT NULL
+    AND user = {user.id};
     """
     Order_specific_part_result = await base_ormar_config.database.fetch_one(Order_specific_part_query)
     print(Order_specific_part_result)
@@ -224,40 +393,45 @@ async def get_procurement_mode_summary() -> ProcurementBarChartModel:
     MRP_query_result = await base_ormar_config.database.fetch_one(MRP_query)
     print(MRP_query_result)
 
-    return ProcurementBarChartModel(Order_specific_sum=Order_specific_part_result["Total_Stock_Value"] if Order_specific_part_result else 0, kanban_sum=kanban_query_result["Total_Stock_Value"] if kanban_query_result else 0, MRP_sum=MRP_query_result["Total_Stock_Value"] if MRP_query_result else 0)
+    return ProcurementBarChartModelDto(Order_specific_sum=Order_specific_part_result["Total_Stock_Value"] if Order_specific_part_result else 0, kanban_sum=kanban_query_result["Total_Stock_Value"] if kanban_query_result else 0, MRP_sum=MRP_query_result["Total_Stock_Value"] if MRP_query_result else 0, user_id=user.id)
 
 
-@app.get("/coverage_class_bar_chart_data", response_model=CoverageClassBarChartModel)
-async def get_coverage_class_summary() -> CoverageClassBarChartModel:
+@app.get("/coverage_class_bar_chart_data", response_model=CoverageClassBarChartModelDto)
+async def get_coverage_class_summary(user: UserModel = Depends(get_current_user)) -> CoverageClassBarChartModelDto:
     Order_specific_part_query = f"""
         SELECT SUM("Stock Value") AS Total_Stock_Value
     FROM my_table
     WHERE "Coverage class" = 'Order specific'
-    AND "Stock Value" IS NOT NULL;
+    AND "Stock Value" IS NOT NULL
+    AND user = {user.id};
     """
     fifteen_Days_query = f"""
         SELECT SUM("Stock Value") AS Total_Stock_Value
     FROM my_table
     WHERE "Coverage class" = '<15 days'
-    AND "Stock Value" IS NOT NULL;
+    AND "Stock Value" IS NOT NULL
+    AND user = {user.id};
     """
     thirty_Days_query = f"""
     SELECT SUM("Stock Value") AS Total_Stock_Value
     FROM my_table
     WHERE "Coverage class" = '<30 days'
-    AND "Stock Value" IS NOT NULL;
+    AND "Stock Value" IS NOT NULL
+    AND user = {user.id};
     """
     ninety_Days_query = f"""
     SELECT SUM("Stock Value") AS Total_Stock_Value
     FROM my_table
     WHERE "Coverage class" = '<90 days'
-    AND "Stock Value" IS NOT NULL;
+    AND "Stock Value" IS NOT NULL
+    AND user = {user.id};
     """
     ninety_plus_Days_query = f"""
     SELECT SUM("Stock Value") AS Total_Stock_Value
     FROM my_table
     WHERE "Coverage class" = '>90 days'
-    AND "Stock Value" IS NOT NULL;
+    AND "Stock Value" IS NOT NULL
+    AND user = {user.id};
     """
     Order_specific_part_result = await base_ormar_config.database.fetch_one(Order_specific_part_query)
     print(Order_specific_part_result)
@@ -267,11 +441,11 @@ async def get_coverage_class_summary() -> CoverageClassBarChartModel:
     ninety_Days_result = await base_ormar_config.database.fetch_one(ninety_Days_query)
     ninety_plus_Days_result = await base_ormar_config.database.fetch_one(ninety_plus_Days_query)
 
-    return CoverageClassBarChartModel(Order_specific_sum=Order_specific_part_result["Total_Stock_Value"] if Order_specific_part_result else 0, fifteen_Days_sum=fifteen_Days_result["Total_Stock_Value"] if fifteen_Days_result else 0, thirty_Days_sum=thirty_Days_result["Total_Stock_Value"] if thirty_Days_result else 0, ninety_Days_sum=ninety_Days_result["Total_Stock_Value"] if ninety_Days_result else 0, ninety_plus_Days_sum=ninety_plus_Days_result["Total_Stock_Value"] if ninety_plus_Days_result else 0)
+    return CoverageClassBarChartModelDto(Order_specific_sum=Order_specific_part_result["Total_Stock_Value"] if Order_specific_part_result else 0, fifteen_Days_sum=fifteen_Days_result["Total_Stock_Value"] if fifteen_Days_result else 0, thirty_Days_sum=thirty_Days_result["Total_Stock_Value"] if thirty_Days_result else 0, ninety_Days_sum=ninety_Days_result["Total_Stock_Value"] if ninety_Days_result else 0, ninety_plus_Days_sum=ninety_plus_Days_result["Total_Stock_Value"] if ninety_plus_Days_result else 0, user_id=user.id)
 
 
 @app.post("/inventory/upload")
-async def upload_inventory(file: UploadFile = File(...)):
+async def upload_inventory(file: UploadFile = File(...), user: UserModel = Depends(get_current_user)):
 
     if file.filename is None or not file.filename.endswith(('.xlsx', '.xls')):
         raise HTTPException(
@@ -304,5 +478,16 @@ async def upload_inventory(file: UploadFile = File(...)):
     add_stock_class_column(DB_NAME, table_name)
     add_days_objective_column(DB_NAME, table_name)
     add_benefit_column(DB_NAME, table_name)
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    userID = user.id
+    cursor.execute(f"ALTER TABLE `{table_name}` ADD COLUMN `user` INTEGER")
+    update_query = f"""
+        UPDATE `{table_name}`
+        SET `user` = {userID}
+    """
+    cursor.execute(update_query)
+    conn.commit()
+    conn.close()
 
     return {"message": "File uploaded and processed successfully"}

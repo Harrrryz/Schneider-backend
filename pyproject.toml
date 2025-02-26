@@ -5,7 +5,7 @@ description = "Default template for PDM package"
 authors = [
     {name = "Harrrryz", email = "harry.wadu233@gmail.com"},
 ]
-dependencies = ["fastapi[standard]>=0.115.8", "ormar>=0.20.2", "pandas>=2.2.3", "openpyxl>=3.1.5", "aiosqlite>=0.21.0"]
+dependencies = ["fastapi[standard]>=0.115.8", "ormar>=0.20.2", "pandas>=2.2.3", "openpyxl>=3.1.5", "aiosqlite>=0.21.0", "pyjwt>=2.10.1", "passlib[bcrypt]>=1.7.4"]
 requires-python = "==3.12.*"
 readme = "README.md"
 license = {text = "MIT"}
